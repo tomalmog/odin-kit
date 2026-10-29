@@ -8,15 +8,16 @@ yourself doing the task with TaskRecorder while narrating, then you submit four 
 
 ## Setup: one command
 
-Open Claude Code and say:
+The repo is private, so first ask to be added as a collaborator on GitHub and accept the invite.
+Then open Claude Code and say:
 
-> Set me up for Odin with the odin-kit repo at `<repo URL>`.
+> Set me up for Odin with the odin-kit repo at `https://github.com/tomalmog/odin-kit`.
 
 Claude clones it to `~/odin-kit`, asks which of your apps to reopen after recording, and
 runs the installer. Or do it yourself:
 
 ```bash
-git clone <repo URL> ~/odin-kit && ~/odin-kit/install.sh
+git clone https://github.com/tomalmog/odin-kit ~/odin-kit && ~/odin-kit/install.sh
 ```
 
 The installer:

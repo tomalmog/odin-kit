@@ -46,10 +46,10 @@ recording, but its window must not be visible: minimize it (its icon may show in
 ## Install odin-kit
 
 ```bash
-git clone <repo URL> ~/odin-kit && ~/odin-kit/install.sh
+git clone https://github.com/tomalmog/odin-kit ~/odin-kit && ~/odin-kit/install.sh
 ```
 
-(Or ask Claude Code: "Set me up for Odin with the odin-kit repo at <repo URL>.")
+(Or ask Claude Code: "Set me up for Odin with the odin-kit repo at https://github.com/tomalmog/odin-kit.")
 
 The installer:
 - links `odin-mode`, `odin-task`, `odin-check` and `make-phone-script` into `~/.local/bin`, and
