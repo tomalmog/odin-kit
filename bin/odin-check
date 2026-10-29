@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+"""Check this Mac against Odin's setup requirements and say what's still missing.
+
+  odin-check
+"""
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import odinkit  # noqa: E402
+
+CONFIG = odinkit.load()
+MIN_FREE_GB = 35
+failed = 0
+
+
+def check(ok, good, fix, required=True):
+    global failed
+    if ok:
+        print(f"  ✓ {good}")
+    else:
+        print(f"  {'✗' if required else '!'} {fix}")
+        failed += required
+
+
+def app(path):
+    return Path(path).exists()
+
+
+print("Odin setup check")
+major = int(platform.mac_ver()[0].split(".")[0] or 0)
+check(major >= 15, f"macOS {platform.mac_ver()[0]}", "macOS 15 or newer is required.")
+free = shutil.disk_usage(odinkit.HOME).free // 10**9
+check(free >= MIN_FREE_GB, f"{free} GB free",
+      f"Only {free} GB free; Odin asks for at least {MIN_FREE_GB} GB (a recording is 2–3 GB). "
+      "Old TaskRecorder exports are in ~/Library/Application Support/TaskRecorder/recordings.")
+check(app("/Applications/Xcode.app"), "Xcode installed",
+      "Install Xcode from the Mac App Store, then open it once (setup step 1).")
+check(app("/Applications/Xcode.app/Contents/Applications/Accessibility Inspector.app"),
+      "Accessibility Inspector available (odin-mode starts it)",
+      "Accessibility Inspector comes with Xcode; finish installing Xcode (setup step 2).")
+check(app("/Applications/TaskRecorder.app"), "TaskRecorder installed",
+      "Install TaskRecorder 2.4.4 from the Download TaskRecorder card in Studio (setup step 3).")
+check(app(odinkit.CHROME), "Google Chrome installed (also used to make the PDFs)",
+      "Install Google Chrome: odin-task uses it to make the Goal page and phone script.")
+check(app("/Applications/Workpuls.app") or app("/Applications/Insightful.app"), "Insightful installed",
+      "Install Insightful and sign in with your @mercor.expert account to track hours.", required=False)
+
+name = subprocess.run(["scutil", "--get", "ComputerName"], capture_output=True, text=True).stdout.strip()
+check("’s " not in name and "'s " not in name, f'Mac name "{name}" looks generic',
+      f'Your Mac is named "{name}". Rename it (System Settings > General > About), e.g. "MacBook Pro", '
+      "so no name shows on screen.", required=False)
+
+check(odinkit.CONFIG_FILE.exists(), f"Settings in {odinkit.CONFIG_FILE}", "Run ./install.sh in the odin-kit folder.")
+tasks = odinkit.tasks_dir(CONFIG)
+check(tasks.is_dir(), f"Task folders go in {tasks}", "Run ./install.sh to create the workspace.")
+on_path = all(shutil.which(t) for t in ("odin-mode", "odin-task"))
+check(on_path, "odin-mode and odin-task are on your PATH",
+      "Open a new terminal (install.sh added ~/.local/bin to your PATH in ~/.zshrc).", required=False)
+missing = [a for a in CONFIG["reopen_on_off"]
+           if subprocess.run(["open", "-Ra", a], capture_output=True).returncode]
+check(not missing, "Apps to reopen after recording: " + (", ".join(CONFIG["reopen_on_off"]) or "none"),
+      f"These reopen_on_off apps weren't found: {', '.join(missing)} (fix the names in {odinkit.CONFIG_FILE}).",
+      required=False)
+
+print("""
+Check these by hand (no command can see them):
+  - TaskRecorder has Screen Recording, Accessibility, Microphone and Input Monitoring in
+    System Settings > Privacy & Security, and a short test recording has video and sound.
+  - Your recording browser uses a fresh profile: no history, bookmarks, saved addresses or avatar.
+  - On each task page in Studio, the five "did you do this step?" setup questions say Yes.""")
+print("\nAll required checks passed." if not failed else f"\n{failed} required item(s) to fix (✗ above).")
+sys.exit(1 if failed else 0)

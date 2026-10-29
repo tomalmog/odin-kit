@@ -1,0 +1,37 @@
+{
+  "workspace": "~/odin",
+  "dock_apps": [
+    "/Applications/Google Chrome.app",
+    "/Applications/TaskRecorder.app"
+  ],
+  "dock_side": "left",
+  "reopen_on_off": [],
+  "keep_running": [
+    "com.google.Chrome",
+    "com.apple.finder",
+    "com.google.anvil.TaskRecorder2",
+    "com.apple.AccessibilityInspector",
+    "com.workpuls.Agent",
+    "com.anthropic.claudefordesktop",
+    "com.apple.Terminal",
+    "com.googlecode.iterm2"
+  ],
+  "ai_app_bundles": [
+    "/Applications/ChatGPT.app",
+    "/Applications/Codex.app",
+    "/Applications/Cursor.app",
+    "/Applications/Kimi.app",
+    "/Applications/Antigravity.app",
+    "/Applications/OpenCode.app"
+  ],
+  "wallpapers": [
+    "/System/Library/Desktop Pictures/Solid Colors/Plum.png",
+    "/System/Library/Desktop Pictures/Solid Colors/Red Orange.png",
+    "/System/Library/Desktop Pictures/Solid Colors/Ocher.png",
+    "/System/Library/Desktop Pictures/Solid Colors/Dusty Rose.png",
+    "/System/Library/Desktop Pictures/Solid Colors/Gold.png",
+    "/System/Library/Desktop Pictures/Solid Colors/Space Gray.png"
+  ],
+  "dark_mode": true,
+  "hide_desktop_and_downloads": true
+}

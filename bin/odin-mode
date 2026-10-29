@@ -1,0 +1,391 @@
+#!/usr/bin/python3
+"""Switch this Mac between its normal setup and the Odin recording setup.
+
+  odin-mode on [task id]  save your normal setup and apply the recording one; with a task id,
+                          also copy tasks/<id>/inputs into Downloads and its Goal.pdf into
+                          /Users/Shared (running it again with a new id rotates the wallpaper)
+  odin-mode off           put everything back the way it was
+  odin-mode status        show which mode is active and what the Mac looks like now
+  odin-mode quit-apps     quit every app a recording doesn't need (Claude is left for last)
+  odin-mode config        show the settings in use and where to change them
+"""
+import json
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import odinkit  # noqa: E402
+
+CONFIG = odinkit.load()
+HOME = odinkit.HOME
+STATE_DIR = odinkit.STATE_DIR
+MODE_FILE = STATE_DIR / "mode"
+NORMAL_DOCK = STATE_DIR / "normal-dock.plist"
+NORMAL_CLOCK = STATE_DIR / "normal-clock.plist"
+NORMAL_APPEARANCE = STATE_DIR / "normal-appearance"
+NORMAL_EXTRAS = STATE_DIR / "normal-extras.json"
+NORMAL_WALLPAPER = STATE_DIR / "normal-wallpaper-index.plist"
+WALLPAPER_TURN = STATE_DIR / "wallpaper-turn"
+WALLPAPER_STORE = HOME / "Library/Application Support/com.apple.wallpaper/Store/Index.plist"
+
+DESKTOP = HOME / "Desktop"
+DESKTOP_HOLD = HOME / "Documents" / "Desktop items"
+DOWNLOADS = HOME / "Downloads"
+DOWNLOADS_HOLD = HOME / "Downloads-hold"
+
+TASKS = odinkit.tasks_dir(CONFIG)
+SHARED_GOAL = Path("/Users/Shared/Goal.pdf")
+
+INSPECTOR = "/Applications/Xcode.app/Contents/Applications/Accessibility Inspector.app"
+
+# (domain, key, per-host?, value in Odin mode). Desktop widgets get hidden, and Handoff is
+# turned off so apps open on an iPhone don't show up in the Dock.
+RECORDING_SETTINGS = [
+    ("com.apple.WindowManager", "StandardHideWidgets", False, True),
+    ("com.apple.coreservices.useractivityd", "ActivityAdvertisingAllowed", True, False),
+    ("com.apple.coreservices.useractivityd", "ActivityReceivingAllowed", True, False),
+]
+SETTINGS_PROCESSES = ["WindowManager", "useractivityd"]
+
+
+def run(*cmd, data=None):
+    return subprocess.run(cmd, input=data, capture_output=True, check=True).stdout
+
+
+def read_domain(domain):
+    return plistlib.loads(run("defaults", "export", domain, "-"))
+
+
+def write_domain(domain, values):
+    # `defaults import` merges keys, so clear the domain first to drop keys the
+    # saved copy never had (e.g. ShowSeconds when restoring the normal clock).
+    subprocess.run(["defaults", "delete", domain], capture_output=True)
+    run("defaults", "import", domain, "-", data=plistlib.dumps(values))
+
+
+def dock_tile(app_path):
+    return {
+        "tile-type": "file-tile",
+        "tile-data": {
+            "file-label": Path(app_path).stem,
+            "file-data": {"_CFURLString": Path(app_path).as_uri() + "/", "_CFURLStringType": 15},
+        },
+    }
+
+
+def dark_mode():
+    style = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                           capture_output=True, text=True).stdout.strip()
+    return style == "Dark"
+
+
+def set_dark_mode(dark):
+    script = f'tell application "System Events" to tell appearance preferences to set dark mode to {str(dark).lower()}'
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+def defaults_cmd(per_host):
+    return ["defaults", "-currentHost"] if per_host else ["defaults"]
+
+
+def read_bool(domain, key, per_host):
+    result = subprocess.run(defaults_cmd(per_host) + ["read", domain, key],
+                            capture_output=True, text=True)
+    return None if result.returncode else result.stdout.strip() == "1"
+
+
+def write_bool(domain, key, per_host, value):
+    if value is None:
+        subprocess.run(defaults_cmd(per_host) + ["delete", domain, key], capture_output=True)
+    else:
+        run(*defaults_cmd(per_host), "write", domain, key, "-bool", "true" if value else "false")
+
+
+def save_settings():
+    values = {f"{d} {k}": read_bool(d, k, h) for d, k, h, _ in RECORDING_SETTINGS}
+    NORMAL_EXTRAS.write_text(json.dumps(values, indent=2) + "\n")
+
+
+def apply_settings(normal):
+    saved = json.loads(NORMAL_EXTRAS.read_text()) if normal else {}
+    for domain, key, per_host, recording in RECORDING_SETTINGS:
+        write_bool(domain, key, per_host, saved.get(f"{domain} {key}") if normal else recording)
+    for process in SETTINGS_PROCESSES:
+        restart(process)
+
+
+def set_recording_wallpaper(save_normal=True):
+    pictures = [p for p in CONFIG["wallpapers"] if Path(p).exists()]
+    if not pictures:
+        return "unchanged (none of the configured wallpapers exist on this Mac)"
+    if save_normal and WALLPAPER_STORE.exists():
+        shutil.copy2(WALLPAPER_STORE, NORMAL_WALLPAPER)
+    turn = int(WALLPAPER_TURN.read_text()) if WALLPAPER_TURN.exists() else 0
+    picture = pictures[turn % len(pictures)]
+    WALLPAPER_TURN.write_text(f"{turn + 1}\n")
+    script = f'tell application "System Events" to tell every desktop to set picture to POSIX file "{picture}"'
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+    return f"{Path(picture).stem} (a different colour each time)"
+
+
+def restore_wallpaper():
+    shutil.copy2(NORMAL_WALLPAPER, WALLPAPER_STORE)
+    restart("WallpaperAgent")
+
+
+def restart(process):
+    subprocess.run(["killall", process], capture_output=True)
+
+
+def move_contents(src, dst):
+    """Move every visible item from src into dst; never overwrite. Returns (moved, skipped)."""
+    dst.mkdir(parents=True, exist_ok=True)
+    moved, skipped = 0, []
+    for item in sorted(src.iterdir()):
+        if item.name.startswith("."):
+            continue
+        target = dst / item.name
+        if target.exists():
+            skipped.append(f"{item.name} (already in {dst.name})")
+            continue
+        try:
+            item.rename(target)
+            moved += 1
+        except OSError as e:
+            skipped.append(f"{item.name} ({e.strerror})")
+    return moved, skipped
+
+
+def visible_count(folder):
+    if not folder.exists():
+        return 0
+    return sum(1 for p in folder.iterdir() if not p.name.startswith("."))
+
+
+def is_on():
+    return MODE_FILE.exists() and MODE_FILE.read_text().strip() == "on"
+
+
+def report(label, moved, skipped):
+    print(f"  {label}: moved {moved}")
+    for s in skipped:
+        print(f"    left in place: {s}")
+
+
+def start_inspector():
+    if Path(INSPECTOR).exists():
+        subprocess.run(["open", "-g", INSPECTOR])
+        print("  Accessibility Inspector: started")
+    else:
+        print("  Accessibility Inspector: not found. Install Xcode from the Mac App Store first.")
+
+
+def turn_on(task=None):
+    if is_on():
+        if task:
+            # A new recording in the same session still needs a different look.
+            print(f"  Wallpaper: {set_recording_wallpaper(save_normal=False)}")
+            load_task(task)
+            start_inspector()
+            return
+        sys.exit("Odin mode is already on. Run `odin-mode off` first.")
+    if task and not (TASKS / task).is_dir():
+        sys.exit(f"No task folder at {TASKS / task}")
+    if any(DOWNLOADS.glob("*.crdownload")) or any(DOWNLOADS.glob("*.download")):
+        sys.exit("A download is still in progress. Wait for it to finish, then try again.")
+    side = CONFIG["dock_side"]
+    if side not in ("left", "right"):
+        sys.exit(f'dock_side must be "left" or "right" (Odin rejects a bottom Dock), not "{side}".')
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    dock = read_domain("com.apple.dock")
+    clock = read_domain("com.apple.menuextra.clock")
+    NORMAL_DOCK.write_bytes(plistlib.dumps(dock))
+    NORMAL_CLOCK.write_bytes(plistlib.dumps(clock))
+    NORMAL_APPEARANCE.write_text("dark\n" if dark_mode() else "light\n")
+    save_settings()
+    MODE_FILE.write_text("on\n")
+
+    print("Turning Odin mode on:")
+    apps = [a for a in CONFIG["dock_apps"] if Path(a).exists()]
+    for missing in sorted(set(CONFIG["dock_apps"]) - set(apps)):
+        print(f"  Dock: skipped {missing} (not installed)")
+    dock["orientation"] = side
+    dock["autohide"] = False
+    dock["show-process-indicators"] = True
+    dock["persistent-apps"] = [dock_tile(path) for path in apps]
+    dock["persistent-others"] = []
+    write_domain("com.apple.dock", dock)
+    restart("Dock")
+    print(f"  Dock: {side}, always showing, only {', '.join(Path(a).stem for a in apps)} pinned")
+
+    clock.update(ShowSeconds=True, ShowDate=1, IsAnalog=False)
+    write_domain("com.apple.menuextra.clock", clock)
+    restart("ControlCenter")
+    print("  Clock: date and seconds shown")
+
+    apply_settings(normal=False)
+    print("  Desktop widgets: hidden; Handoff: off")
+
+    if CONFIG["dark_mode"]:
+        set_dark_mode(True)
+        print("  Appearance: dark mode")
+    print(f"  Wallpaper: {set_recording_wallpaper()}")
+
+    if CONFIG["hide_desktop_and_downloads"]:
+        report("Desktop -> Documents/Desktop items", *move_contents(DESKTOP, DESKTOP_HOLD))
+        report("Downloads -> Downloads-hold", *move_contents(DOWNLOADS, DOWNLOADS_HOLD))
+
+    if task:
+        load_task(task)
+
+    start_inspector()
+
+    print(f"""
+Still to do by hand:
+  - Close Accessibility Inspector's window with the red button (don't quit it).
+  - Turn on Do Not Disturb on the Mac and your phone.
+  - Run `odin-mode quit-apps` to quit everything a recording doesn't need, then quit Claude.
+  - Open the intro doc in its own browser window: file://{SHARED_GOAL}""")
+
+
+def load_task(task):
+    folder = TASKS / task
+    if not folder.is_dir():
+        sys.exit(f"No task folder at {folder}")
+    for item in sorted((folder / "inputs").glob("*")) if (folder / "inputs").is_dir() else []:
+        shutil.copy2(item, DOWNLOADS / item.name)
+        print(f"  Downloads: added {item.name}")
+    if (folder / "Goal.pdf").exists():
+        shutil.copy2(folder / "Goal.pdf", SHARED_GOAL)
+        print(f"  Goal page: {SHARED_GOAL} now shows task {task}")
+    else:
+        print(f"  Goal page: no Goal.pdf yet. Run `odin-task build {task}` first.")
+
+
+def turn_off():
+    if not is_on():
+        sys.exit("Odin mode is already off.")
+
+    print("Turning Odin mode off:")
+    write_domain("com.apple.dock", plistlib.loads(NORMAL_DOCK.read_bytes()))
+    restart("Dock")
+    print("  Dock: restored")
+
+    write_domain("com.apple.menuextra.clock", plistlib.loads(NORMAL_CLOCK.read_bytes()))
+    restart("ControlCenter")
+    print("  Clock: restored")
+
+    if NORMAL_EXTRAS.exists():
+        apply_settings(normal=True)
+        print("  Desktop widgets and Handoff: restored")
+
+    if NORMAL_WALLPAPER.exists():
+        restore_wallpaper()
+        print("  Wallpaper: restored")
+
+    if NORMAL_APPEARANCE.exists():
+        set_dark_mode(NORMAL_APPEARANCE.read_text().strip() == "dark")
+        print("  Appearance: restored")
+
+    for hold, home, label in [
+        (DESKTOP_HOLD, DESKTOP, "Documents/Desktop items -> Desktop"),
+        (DOWNLOADS_HOLD, DOWNLOADS, "Downloads-hold -> Downloads"),
+    ]:
+        if hold.exists():
+            report(label, *move_contents(hold, home))
+            if visible_count(hold) == 0:
+                for leftover in hold.iterdir():  # only .DS_Store-style files remain
+                    leftover.unlink()
+                hold.rmdir()
+
+    MODE_FILE.unlink()
+    for app in CONFIG["reopen_on_off"]:
+        if subprocess.run(["open", "-g", "-a", app], capture_output=True).returncode == 0:
+            print(f"  Reopened {app}")
+        else:
+            print(f"  Couldn't reopen {app} (check the name in {odinkit.CONFIG_FILE})")
+    print("\nTurn off Do Not Disturb.")
+
+
+def running_apps():
+    """(name, bundle id) for regular apps and third-party menu-bar apps, skipping helpers."""
+    apps = []
+    for block in re.split(r"\n(?=\s*\d+\) \")", run("lsappinfo", "list").decode()):
+        name = re.search(r'\) "([^"]+)"', block)
+        bundle = re.search(r'bundleID="([^"]+)"', block)
+        kind = re.search(r'type="([^"]+)"', block)
+        if not (name and bundle and kind):
+            continue
+        bundle_id = bundle.group(1)
+        if kind.group(1) == "UIElement" and bundle_id.startswith("com.apple."):
+            continue
+        if kind.group(1) in ("Foreground", "UIElement") and not bundle_id.endswith(".helper"):
+            apps.append((name.group(1), bundle_id))
+    return apps
+
+
+def quit_apps():
+    keep = set(CONFIG["keep_running"])
+    to_quit = [(n, b) for n, b in running_apps() if b not in keep]
+    if not to_quit:
+        print("Nothing to quit.")
+    failed = []
+    for name, bundle_id in to_quit:
+        result = subprocess.run(
+            ["osascript", "-e", f'tell application id "{bundle_id}" to quit'],
+            capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"  quit {name}")
+        else:
+            failed.append(name)
+    for bundle in CONFIG["ai_app_bundles"]:
+        pattern = bundle + "/"
+        if subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode == 0:
+            subprocess.run(["pkill", "-f", pattern], capture_output=True)
+            print(f"  stopped background processes of {Path(bundle).stem}")
+    for name in failed:
+        print(f"  couldn't quit {name}: quit it yourself with Command + Q")
+    print("\nLast step before recording: quit Claude.")
+
+
+def status():
+    dock = read_domain("com.apple.dock")
+    clock = read_domain("com.apple.menuextra.clock")
+    inspector = subprocess.run(["pgrep", "-f", "Accessibility Inspector.app"],
+                               capture_output=True).returncode == 0
+    print(f"Odin mode: {'ON' if is_on() else 'off'}")
+    print(f"  Dock: {dock.get('orientation', 'bottom')}, "
+          f"auto-hide {'on' if dock.get('autohide') else 'off'}")
+    print(f"  Clock: seconds {'on' if clock.get('ShowSeconds') else 'off'}, "
+          f"date {'always' if clock.get('ShowDate') == 1 else 'not always'}")
+    print(f"  Desktop: {visible_count(DESKTOP)} items "
+          f"({visible_count(DESKTOP_HOLD)} held in Documents/Desktop items)")
+    print(f"  Downloads: {visible_count(DOWNLOADS)} items "
+          f"({visible_count(DOWNLOADS_HOLD)} held in Downloads-hold)")
+    print(f"  Appearance: {'dark' if dark_mode() else 'light'}")
+    hidden = read_bool("com.apple.WindowManager", "StandardHideWidgets", False)
+    handoff = read_bool("com.apple.coreservices.useractivityd", "ActivityAdvertisingAllowed", True)
+    print(f"  Desktop widgets: {'hidden' if hidden else 'shown'}; "
+          f"Handoff: {'off' if handoff is False else 'on'}")
+    print(f"  Accessibility Inspector: {'running' if inspector else 'not running'}")
+
+
+def show_config():
+    source = odinkit.CONFIG_FILE if odinkit.CONFIG_FILE.exists() else "built-in defaults (no config file yet)"
+    print(f"Settings from: {source}")
+    print(f"Task folders:  {TASKS}")
+    print(json.dumps(CONFIG, indent=2))
+
+
+if __name__ == "__main__":
+    commands = {"on": turn_on, "off": turn_off, "status": status, "quit-apps": quit_apps,
+                "config": show_config}
+    args = sys.argv[1:]
+    if not args or args[0] not in commands or len(args) > (2 if args[0] == "on" else 1):
+        sys.exit(__doc__.strip())
+    commands[args[0]](*args[1:])

@@ -1,0 +1,19 @@
+#!/usr/bin/python3
+"""Turn a task's SCRIPT.md into a phone-sized PDF, one card per beat.
+
+  make-phone-script <task folder>
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import odinkit  # noqa: E402
+import phone_script  # noqa: E402
+
+if len(sys.argv) != 2:
+    sys.exit(__doc__.strip())
+task = Path(sys.argv[1]).expanduser().resolve()
+page = task / "script-phone.html"
+page.write_text(phone_script.build((task / "SCRIPT.md").read_text()))
+odinkit.print_pdf(page, task / "Script (phone).pdf")
+print(task / "Script (phone).pdf")

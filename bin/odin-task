@@ -1,0 +1,283 @@
+#!/usr/bin/python3
+"""Set up, build and package an Odin task folder (<workspace>/tasks/<task id>/).
+
+  odin-task new <task id>      make the folder from the templates
+  odin-task build <task id>    make goal.txt, Goal.pdf, Metadata.rtf and the phone script from
+                               IDEA.md, METADATA.md and SCRIPT.md, and check they agree
+  odin-task package <task id> [recording.zip]
+                               get it ready for submission: make submit/ with video.mp4, the
+                               TaskRecorder zip, Metadata.rtf and Deliverables.zip, check the
+                               recording against the idea, and print the Studio steps.
+                               Default zip: TaskRecorder's newest. If deliverables/ is empty,
+                               files downloaded during the recording are copied into it.
+  odin-task list               show every task folder and what it still needs
+"""
+import html
+import json
+import re
+import shutil
+import sys
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import odinkit  # noqa: E402
+import phone_script  # noqa: E402
+
+CONFIG = odinkit.load()
+TASKS = odinkit.tasks_dir(CONFIG)
+TEMPLATES = odinkit.KIT_ROOT / "templates"
+RECORDINGS = odinkit.HOME / "Library/Application Support/TaskRecorder/recordings"
+DOWNLOADS = odinkit.HOME / "Downloads"
+MIN_SECONDS, MAX_SECONDS = 15 * 60, 50 * 60 + 59
+
+# Deliverables.zip names each file by its role: "input 1.csv", "artifact 1.png", "final output 1.pdf".
+ROLES = [("inputs", "input"), ("artifacts", "artifact"), ("deliverables", "final output")]
+
+SUBMIT_STEPS = """
+Ready to submit. In Studio, on the task page:
+  1. Watch the video once: the intro (under 20 s), each CHECK you weren't sure of, the downloads,
+     the epilogue (3+ minutes), and the last minutes for anything personal.
+  2. Upload from {submit}:
+       Screen recording     -> video.mp4
+       TaskRecorder export  -> {zip}
+       Deliverables         -> Deliverables.zip
+       Metadata             -> Metadata.rtf
+     Keep the Mac awake and the tab in front until every field shows its file name.
+  3. Click Run AutoQC. Narration checks run about 10 minutes later. Dispute only findings
+     that are wrong: Dispute -> explain why -> Submit dispute.
+  4. Answer the five "did you do this step?" setup questions: Yes, I did this step.
+  5. Tick each manual check after checking it against your recording.
+  6. Final note: {note}
+     (For generated input data, also tick "AI-generated before recording" and don't name the tool.)
+  7. Click Submit for Review. The status should move to Routing, then Quick Review or In Review.
+  8. Run `odin-mode off` when you're done recording for the day.
+"""
+
+
+def folder(task):
+    path = TASKS / task
+    if not path.is_dir():
+        sys.exit(f"No task folder at {path}. Run `odin-task new {task}` first.")
+    return path
+
+
+def new(task):
+    path = TASKS / task
+    if path.exists():
+        sys.exit(f"{path} already exists.")
+    path.mkdir(parents=True)
+    for name in ("IDEA.md", "METADATA.md", "SCRIPT.md", "FILM-DAY.md"):
+        text = (TEMPLATES / name).read_text().replace("{task}", task)
+        text = text.replace("{workspace}", str(odinkit.workspace(CONFIG)))
+        (path / name).write_text(text)
+    for sub, _ in ROLES:
+        (path / sub).mkdir()
+    print(f"Made {path}")
+    print("Next: paste the approved idea into IDEA.md, fill in METADATA.md, write SCRIPT.md,")
+    print(f"then run `odin-task build {task}`.")
+
+
+def field(text, name):
+    match = re.search(rf"^\**{name}:?\**:?\s*(.+)$", text, re.M)
+    return match.group(1).strip() if match else ""
+
+
+def numbered(text, after):
+    tail = text[text.index(after):] if after in text else ""
+    return [m.group(1).strip() for m in re.finditer(r"^\s*\d+\.\s+(.+)$", tail, re.M)]
+
+
+def app_names(text):
+    return {a.strip().lower() for a in re.split(r",|\n", text) if a.strip()}
+
+
+def rtf_escape(s):
+    s = s.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    # Studio reads the RTF as cp1252, so accented letters (café) need escapes.
+    return "".join(c if ord(c) < 128 else f"\\'{c.encode('cp1252')[0]:02x}" for c in s)
+
+
+def metadata_rtf(topology, goal, steps):
+    lines = "\\\n".join(f"{i}. {rtf_escape(s)}" for i, s in enumerate(steps, 1))
+    return ("{\\rtf1\\ansi\\ansicpg1252\\cocoartf2822\n"
+            "{\\fonttbl\\f0\\fswiss\\fcharset0 Helvetica-Bold;\\f1\\fswiss\\fcharset0 Helvetica;}\n"
+            "\\margl1440\\margr1440\\vieww11520\\viewh8400\\viewkind0\n"
+            "\\pard\\pardirnatural\\partightenfactor0\n"
+            f"\\fs24 \\f0\\b Topology:\\f1\\b0  {rtf_escape(topology)}\\\n"
+            f"\\f0\\b Request:\\f1\\b0  {rtf_escape(goal)}\\\n"
+            "\\f0\\b Task Description:\\f1\\b0 \\\n"
+            f"{lines}}}")
+
+
+def build(task):
+    path = folder(task)
+    idea = (path / "IDEA.md").read_text()
+    goal = field(idea, "Goal")
+    if not goal or goal.startswith("<"):
+        sys.exit("IDEA.md has no Goal yet. Paste the approved idea text in first.")
+    problems = []
+
+    (path / "goal.txt").write_text(goal)
+    (path / "intro.html").write_text(
+        '<!doctype html><html><head><meta charset="utf-8"><title>Goal</title>\n'
+        "<style>@page { size: Letter landscape; margin: 0.9in; }\n"
+        "body { font-family: Helvetica, Arial, sans-serif; color: #111; }\n"
+        "p { font-size: 26pt; line-height: 1.45; margin: 1.2in 0 0; }</style></head>\n"
+        f"<body><p>{html.escape(goal)}</p></body></html>")
+    odinkit.print_pdf(path / "intro.html", path / "Goal.pdf")
+    print("  goal.txt and Goal.pdf: made from the idea's Goal")
+
+    meta = (path / "METADATA.md").read_text()
+    topology = field(meta, "Topology")
+    steps = numbered(meta, "Task Description")
+    if "<" in topology or any(s.startswith("<") for s in steps):
+        problems.append("METADATA.md still has <placeholders>; fill in the Topology and Task Description.")
+    elif topology and steps:
+        (path / "Metadata.rtf").write_text(metadata_rtf(topology, goal, steps))
+        print("  Metadata.rtf: Topology, Request (= the Goal) and Task Description")
+    else:
+        problems.append("METADATA.md needs a Topology line and a numbered Task Description.")
+
+    # AutoQC compares TaskRecorder's Used Apps with the idea's Apps field, and the reviewer
+    # compares both with the Topology, so all three must name the same apps.
+    apps = app_names(field(idea, "Apps"))
+    used = {re.sub(r"\s*\(.*$", "", v).strip().lower() for v in topology.split("->")} if topology else set()
+    if not apps:
+        problems.append("IDEA.md has no **Apps:** line (copy it from the idea's Apps field).")
+    elif used - apps:
+        problems.append(f"Topology uses {', '.join(sorted(used - apps))}, which the Apps list doesn't have.")
+    if any("chrome" in a for a in apps) and any("sheets" in a for a in apps):
+        problems.append("The Apps list has Chrome as well as Google Sheets. Reviewers want only the apps "
+                        "you work in; if the idea already lists Chrome, list it in TaskRecorder too.")
+
+    script = (path / "SCRIPT.md").read_text()
+    # Only the Say column (the last cell of each script row) is narration.
+    says = " ".join(phone_script.cells(r)[-1] for r in script.splitlines()
+                    if r.startswith("| ") and not r.startswith(("| Time", "|---")))
+    if re.search(r"\bExcel\b", says):
+        problems.append('SCRIPT.md says "Excel" in a Say line. Say "Google Sheets" or "the .xlsx option".')
+    if all(h in script for h in ("## Intro", "## After you stop", "## Numbers to expect")):
+        page = path / "script-phone.html"
+        page.write_text(phone_script.build(script))
+        odinkit.print_pdf(page, path / "Script (phone).pdf")
+        print("  Script (phone).pdf: made from SCRIPT.md")
+    else:
+        problems.append('SCRIPT.md needs "## Intro", "## After you stop" and "## Numbers to expect" '
+                        "sections before the phone script can be made.")
+
+    for p in problems:
+        print(f"  ! {p}")
+    print("Done." if not problems else f"\n{len(problems)} thing(s) to fix, then run this again.")
+
+
+def newest_recording():
+    zips = sorted(RECORDINGS.glob("recording_*.zip"), key=lambda p: p.stat().st_mtime)
+    if not zips:
+        sys.exit(f"No recording zips in {RECORDINGS}. Export the recording from TaskRecorder first.")
+    return zips[-1]
+
+
+def utc(stamp):
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def collect_downloads(path, start, end):
+    """Copy what was downloaded during the recording into deliverables/, oldest first."""
+    found = sorted((p for p in DOWNLOADS.iterdir()
+                    if p.is_file() and not p.name.startswith(".") and start <= p.stat().st_mtime <= end + 60),
+                   key=lambda p: p.stat().st_mtime)
+    for i, item in enumerate(found, 1):
+        shutil.copy2(item, path / "deliverables" / f"{i:02d} {item.name}")
+        print(f"  deliverables/: copied {item.name} from Downloads (downloaded during the recording)")
+    return found
+
+
+def package(task, recording=None):
+    path = folder(task)
+    zip_path = Path(recording).expanduser() if recording else newest_recording()
+    if not (path / "Metadata.rtf").exists():
+        sys.exit(f"No Metadata.rtf yet. Run `odin-task build {task}` first.")
+    problems = []
+
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+        video = next((n for n in names if n.endswith("/video.mp4")), None)
+        meta = next((n for n in names if n.endswith("/metadata.json")), None)
+        if not (video and meta):
+            sys.exit(f"{zip_path.name} has no video.mp4 or metadata.json inside. Is it a TaskRecorder export?")
+        info = json.loads(z.read(meta))
+
+        # TaskRecorder's Goal and Used Apps are what AutoQC compares with the idea.
+        goal = (path / "goal.txt").read_text().strip()
+        if info.get("task_description", "").strip() != goal:
+            problems.append("TaskRecorder's Goal doesn't match goal.txt word for word. Is this the right "
+                            "recording? If so, mention it in the Final note.")
+        recorded = app_names(info.get("apps", ""))
+        idea_apps = app_names(field((path / "IDEA.md").read_text(), "Apps"))
+        if idea_apps - recorded:
+            problems.append(f"TaskRecorder's Used Apps ({info.get('apps')}) miss {', '.join(sorted(idea_apps - recorded))} "
+                            "from the idea's Apps field. AutoQC will flag this; dispute it if the app was only "
+                            "the browser hosting your work.")
+
+        if not any(p for p in (path / "deliverables").glob("*") if not p.name.startswith(".")):
+            if not collect_downloads(path, utc(info["recording_start_utc"]), utc(info["recording_end_utc"])):
+                sys.exit(f"Nothing was downloaded to {DOWNLOADS} during the recording. Put the deliverables "
+                         f"into {path / 'deliverables'} yourself (they become final output 1, 2, ... in name order).")
+
+        submit = path / "submit"
+        submit.mkdir(exist_ok=True)
+        for old in submit.glob("recording_*.zip"):
+            if old.name != zip_path.name:
+                problems.append(f"submit/ also holds an older {old.name}; upload only {zip_path.name}.")
+        shutil.copy2(zip_path, submit / zip_path.name)
+        print(f"  {zip_path.name}: copied unchanged")
+        with z.open(video) as src, open(submit / "video.mp4", "wb") as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+
+    seconds = info.get("recording_task_duration") or 0
+    print(f"  video.mp4: {int(seconds) // 60}:{int(seconds) % 60:02d} long")
+    if not MIN_SECONDS <= seconds <= MAX_SECONDS:
+        problems.append("The video must be between 15:00 and 50:59.")
+
+    shutil.copy2(path / "Metadata.rtf", submit / "Metadata.rtf")
+    print("  Metadata.rtf: copied")
+
+    files = {sub: sorted(p for p in (path / sub).glob("*") if not p.name.startswith("."))
+             for sub, _ in ROLES if (path / sub).is_dir()}
+    with zipfile.ZipFile(submit / "Deliverables.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for sub, role in ROLES:
+            for i, item in enumerate(files.get(sub, []), 1):
+                name = f"{role} {i}{item.suffix}" if item.is_file() else f"{role} {i}"
+                for f in [item] if item.is_file() else sorted(item.rglob("*")):
+                    if f.is_file():
+                        z.write(f, name if item.is_file() else f"{name}/{f.relative_to(item)}")
+                print(f"  Deliverables.zip: {item.name} -> {name}")
+
+    note = field((path / "IDEA.md").read_text(), "Final note / sources").strip("`") or \
+        "No input files; all values typed during recording."
+    for p in problems:
+        print(f"  ! {p}")
+    print(SUBMIT_STEPS.format(submit=submit, zip=zip_path.name, note=note))
+
+
+def list_tasks():
+    if not TASKS.is_dir():
+        sys.exit(f"No tasks yet in {TASKS}.")
+    for path in sorted(p for p in TASKS.iterdir() if p.is_dir()):
+        state = ("packaged" if (path / "submit" / "Deliverables.zip").exists() else
+                 "built" if (path / "Goal.pdf").exists() else "draft")
+        print(f"  {path.name:<20} {state}")
+
+
+if __name__ == "__main__":
+    commands = {"new": (new, 1, 1), "build": (build, 1, 1), "package": (package, 1, 2),
+                "list": (list_tasks, 0, 0)}
+    args = sys.argv[1:]
+    if not args or args[0] not in commands:
+        sys.exit(__doc__.strip())
+    fn, low, high = commands[args[0]]
+    if not low <= len(args) - 1 <= high:
+        sys.exit(__doc__.strip())
+    fn(*args[1:])
