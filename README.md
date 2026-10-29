@@ -3,13 +3,11 @@
 A tested workflow for Mercor's **Odin** project. An idea gets approved, you screen-record
 yourself doing the task with TaskRecorder while narrating, then you submit four files in Studio.
 
-> Keep this repo private and share it only with Odin writers. Rules change, so the Writer
-> Guidelines and the Studio task page always win over anything here.
+> Rules change, so the Writer Guidelines and the Studio task page always win over anything here.
 
 ## Setup: one command
 
-The repo is private, so first ask to be added as a collaborator on GitHub and accept the invite.
-Then open Claude Code and say:
+Open Claude Code and say:
 
 > Set me up for Odin with the odin-kit repo at `https://github.com/tomalmog/odin-kit`.
 
